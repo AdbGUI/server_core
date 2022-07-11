@@ -1,8 +1,28 @@
 [package]
-name = "server_core"
+name = "adbgui_server"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
+actix = "0.13.0"
+actix-cors = "0.6.0-beta.8"
+actix-files = "0.6.1"
+actix-http = "3.0.4"
+actix-identity = "0.4.0-beta.8"
+actix-multipart = "0.4.0"
+actix-service = "2.0.2"
+actix-web = "4.0.1"
+actix-web-actors = "4.1.0"
+actix-rt = "2.7"
+actix-test = "0.1.0-beta.12"
+awc = "3.0.0"
+derive_more = "0.99.0"
+dotenv = "0.9.0"
+env_logger = "0.8.2"
+futures = "0.3.5"
+futures-util = "0.3.5"
+log = "0.4.0"
+serde = "1.0.80"
+serde_json = "1.0.13"
+uuid = { version = "0.5", features = ["serde", "v4"] }
+lazy_static = "1.4.0"

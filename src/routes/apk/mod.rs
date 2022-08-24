@@ -1,5 +1,7 @@
 #![allow(dead_code)]
+use std::fs;
 use std::ops::Deref;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use lazy_static::lazy_static;
@@ -10,12 +12,13 @@ mod upload;
 
 pub use self::get_data::*;
 pub use self::upload::*;
+use crate::config_path;
 
 pub const CONFIG_FILE: &str = "apk.json";
 pub const APK_FOLDER: &str = "apk_builds";
 
 lazy_static! {
-    pub static ref APK_SERVICE_CONFG: Mutex<ApkServiceConfig> = Mutex::new(Default::default());
+    pub static ref APK_SERVICE_CONFG: Mutex<ApkServiceConfig> = Mutex::new(ApkServiceConfig::new());
 }
 
 pub fn get_state() -> &'static impl Deref<Target = Mutex<ApkServiceConfig>> {
@@ -30,6 +33,21 @@ pub struct ApkServiceConfig {
 }
 
 impl ApkServiceConfig {
+    pub fn new() -> Self {
+        let cfg_path = config_path();
+        let mut file_cfg = PathBuf::new();
+        file_cfg.push(format!("{cfg_path}/{CONFIG_FILE}"));
+
+        if file_cfg.exists() {
+            if let Ok(file_content) = fs::read_to_string(file_cfg) {
+                serde_json::from_str(&file_content).unwrap()
+            } else {
+                Default::default()
+            }
+        } else {
+            Default::default()
+        }
+    }
     pub fn app_name(&self) -> String {
         self.app_name.clone()
     }
@@ -55,6 +73,16 @@ impl ApkServiceConfig {
     }
 
     pub fn is_empty(&self) -> bool {
+        info!("State Name: {}", self.app_name);
+        info!("State Version: {}", self.version);
+        info!("State Last File: {}", self.last_file);
         self.app_name.is_empty() || self.version.is_empty() || self.last_file.is_empty()
+    }
+    pub fn save(&self) {
+        let cfg_path = config_path();
+        let file_cfg = PathBuf::from(format!("{cfg_path}/{CONFIG_FILE}"));
+
+        let content = serde_json::to_string(self).unwrap();
+        fs::write(file_cfg, content).unwrap();
     }
 }

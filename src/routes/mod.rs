@@ -1,23 +1,28 @@
-use actix_files as fs;
-use actix_web::web;
+use salvo::extra::logging::LogHandler;
+use salvo::extra::serve_static::{DirHandler, Options};
+use salvo::Router;
 
 mod apk;
 pub mod logcat;
 
-pub fn routes(cfg: &mut web::ServiceConfig) {
+pub fn routes() -> Router {
     // static files or website
-    cfg.service(fs::Files::new("/", "./web").index_file("index.html"))
-        // api service
-        .service(
-            web::scope("/api")
-                .service(
-                    web::scope("/apk")
-                        .route("", web::get().to(apk::apk_get_data))
-                        .route("", web::post().to(apk::apk_upload)),
-                )
-                .service(
-                    web::scope("/logcat")
-                        .service(web::resource("/ws/").route(web::get().to(logcat::ws_index))),
-                ),
-        );
+    Router::new()
+        .hoop(LogHandler)
+        .push(
+            Router::with_path("api").push(
+                Router::with_path("apk")
+                    .get(apk::apk_get_data)
+                    .post(apk::apk_upload),
+            )
+            .push(Router::with_path("logcat").handle(logcat::user_connected))
+        )
+        .push(Router::with_path("<**path>").get(DirHandler::width_options(
+            vec!["web"],
+            Options {
+                dot_files: false,
+                listing: false,
+                defaults: vec!["index.html".to_owned()],
+            },
+        )))
 }

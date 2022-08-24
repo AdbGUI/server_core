@@ -1,124 +1,110 @@
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use uuid::Uuid;
+use futures_util::{FutureExt, StreamExt};
+use once_cell::sync::Lazy;
+use tokio::sync::{mpsc, RwLock};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use actix::{
-    fut,
-    prelude::{Actor, Addr, Handler, StreamHandler},
-    ActorContext, ActorFutureExt, AsyncContext, ContextFutureSpawner, WrapFuture,
-};
-use actix_web::{web, HttpRequest, HttpResponse};
-use actix_web_actors::ws;
+use salvo::extra::ws::{Message, WsHandler};
+use salvo::prelude::*;
 
-use crate::errors::Error;
+type TxData = mpsc::UnboundedSender<Result<Message, salvo::Error>>;
 
-mod server;
-pub use self::server::*;
-
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
-
-pub struct WebSocketSession {
-    id: String,
-    hb: Instant,
-    server_addr: Addr<Server>,
+struct UserWs {
+    pub tx: TxData,
+    pub origin: String,
 }
 
-impl WebSocketSession {
-    fn new(server_addr: Addr<Server>) -> Self {
-        Self {
-            id: Uuid::new_v4().to_string(),
-            hb: Instant::now(),
-            server_addr,
-        }
-    }
+type Users = RwLock<HashMap<usize, UserWs>>;
 
-    fn send_heartbeat(&self, ctx: &mut <Self as Actor>::Context) {
-        ctx.run_interval(HEARTBEAT_INTERVAL, |act, ctx| {
-            if Instant::now().duration_since(act.hb) > CLIENT_TIMEOUT {
-                info!("Websocket Client heartbeat failed, disconnecting!");
-                act.server_addr.do_send(Disconnect { id: act.id.clone() });
-                // stop actor
-                ctx.stop();
+static NEXT_USER_ID: AtomicUsize = AtomicUsize::new(1);
+static ONLINE_USERS: Lazy<Users> = Lazy::new(Users::default);
 
-                // don't try to send a ping
-                return;
-            }
-            ctx.ping(b"");
-        });
-    }
-}
+/// If the origin:
+///
+/// desktop => this send the logcat, is a desktop application
+/// web     => is client, this only read the logcat sended by desktop
+///
 
-impl Actor for WebSocketSession {
-    type Context = ws::WebsocketContext<Self>;
+#[handler]
+pub async fn user_connected(req: &mut Request, res: &mut Response) -> Result<(), StatusError> {
+    let origin = (*req.query_or_form::<String>(&"origin".to_owned()).await.unwrap_or("desktop".to_string())).to_string();
+    let fut = WsHandler::new().handle(req, res)?;
+    let fut = async move {
+        if let Some(ws) = fut.await {
+            let my_id = NEXT_USER_ID.fetch_add(1, Ordering::Relaxed);
 
-    fn started(&mut self, ctx: &mut Self::Context) {
-        self.send_heartbeat(ctx);
+            info!("New User: {}", my_id);
 
-        let session_addr = ctx.address();
-        self.server_addr
-            .send(Connect {
-                addr: session_addr.recipient(),
-                id: self.id.clone(),
-            })
-            .into_actor(self)
-            .then(|res, _act, ctx| {
-                match res {
-                    Ok(_res) => {}
-                    _ => ctx.stop(),
+            // Split the socket into a sender and receive of messages.
+            let (user_ws_tx, mut user_ws_rx) = ws.split();
+
+            // Use an unbounded channel to handle buffering and flushing of messages
+            // to the websocket...
+            let (tx, rx) = mpsc::unbounded_channel();
+            let rx = UnboundedReceiverStream::new(rx);
+            let fut = rx.forward(user_ws_tx).map(|result| {
+                if let Err(e) = result {
+                    error!("websocket send error: {e}");
                 }
-                fut::ready(())
-            })
-            .wait(ctx);
-    }
+            });
+            tokio::task::spawn(fut);
+            let fut = async move {
+                ONLINE_USERS.write().await.insert(
+                    my_id,
+                    UserWs {
+                        tx,
+                        origin: origin.to_string(),
+                    },
+                );
+
+                while let Some(result) = user_ws_rx.next().await {
+                    let msg = match result {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            eprintln!("websocket error(uid={}): {}", my_id, e);
+                            break;
+                        }
+                    };
+                    user_message(my_id, msg).await;
+                }
+
+                user_disconnected(my_id).await;
+            };
+            tokio::task::spawn(fut);
+        }
+    };
+    tokio::task::spawn(fut);
+    Ok(())
 }
+async fn user_message(my_id: usize, msg: Message) {
+    let msg = if let Some(s) = msg.to_str() {
+        s
+    } else {
+        return;
+    };
 
-impl Handler<Message> for WebSocketSession {
-    type Result = ();
+    let new_msg = format!("<User#{}>: {}", my_id, msg);
 
-    fn handle(&mut self, msg: Message, ctx: &mut Self::Context) {
-        ctx.text(msg.0);
-    }
-}
+    let users = ONLINE_USERS.read().await;
+    let users = users
+        .iter()
+        .filter(|(&uid, user)| my_id != uid && user.origin != "desktop");
 
-impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession {
-    fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
-        match msg {
-            Ok(ws::Message::Ping(msg)) => {
-                self.hb = Instant::now();
-                ctx.pong(&msg);
-            }
-            Ok(ws::Message::Pong(_)) => {
-                self.hb = Instant::now();
-            }
-            Ok(ws::Message::Binary(bin)) => ctx.binary(bin),
-            Ok(ws::Message::Close(reason)) => {
-                info!("closed ws session");
-                self.server_addr.do_send(Disconnect {
-                    id: self.id.clone(),
-                });
-                ctx.close(reason);
-                ctx.stop();
-            }
-            Err(err) => {
-                warn!("Error handling msg: {:?}", err);
-                ctx.stop()
-            }
-            _ => ctx.stop(),
+    // New message from this user, send it to everyone else (except same uid)...
+    for (&uid, user) in users {
+        if let Err(_disconnected) = user.tx.send(Ok(Message::text(new_msg.clone()))) {
+            // The tx is disconnected, our `user_disconnected` code
+            // should be happening in another task, nothing more to
+            // do here.
+            user_disconnected(uid).await;
         }
     }
 }
 
-pub async fn ws_index(
-    req: HttpRequest,
-    stream: web::Payload,
-    server_addr: web::Data<Addr<Server>>,
-) -> Result<HttpResponse, Error> {
-    let res = ws::start(
-        WebSocketSession::new(server_addr.get_ref().clone()),
-        &req,
-        stream,
-    )?;
-
-    Ok(res)
+async fn user_disconnected(my_id: usize) {
+    eprintln!("good bye user: {}", my_id);
+    // Stream closed up, so remove from the user list
+    ONLINE_USERS.write().await.remove(&my_id);
 }

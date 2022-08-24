@@ -1,62 +1,55 @@
-use std::io::Write;
+use std::{fs, path::PathBuf};
 
-use actix_multipart::Multipart;
-use actix_web::web::{self, Json};
-use futures::{StreamExt, TryStreamExt};
+use salvo::{handler, prelude::StatusError, writer::Json, Request, Response};
 use uuid::Uuid;
 
-use crate::{config_path, errors::Error, model::reply::GenericReply};
+use crate::{config_path, model::reply::GenericReply};
 
 use super::{get_state, APK_FOLDER};
 
-pub async fn apk_upload(mut payload: Multipart) -> Result<Json<GenericReply<String>>, Error> {
+#[handler]
+pub async fn apk_upload(req: &mut Request, res: &mut Response) {
     let file_uuid = Uuid::new_v4().to_string();
     let file_name = format!("{}.apk", file_uuid);
-    let file_path = format!("{}/{}/{}", config_path(), APK_FOLDER, file_name);
+    let mut apk_folder = PathBuf::from(config_path());
+    apk_folder.pop();
+    let file_path = PathBuf::from(format!("{}/{}", apk_folder.to_str().unwrap(), APK_FOLDER));
     let state = get_state();
 
-    // iterate over multipart stream
-    while let Some(mut field) = payload.try_next().await.unwrap() {
-        let file_path = file_path.clone();
-        let file_path_last_name = file_path.clone();
-        // A multipart/form-data stream has to contain `content_disposition`
-        let field_name = field.content_disposition().get_name().unwrap();
-        match field_name {
-            "file" => {
-                // File::create is blocking operation, use threadpool
-                let mut f = web::block(|| std::fs::File::create(file_path))
-                    .await
-                    .unwrap()
-                    .unwrap();
+    fs::create_dir_all(&file_path).unwrap();
 
-                // Field in turn is stream of *Bytes* object
-                while let Some(chunk) = field.try_next().await.unwrap() {
-                    // filesystem operations are blocking, we have to use threadpool
-                    f = web::block(move || f.write_all(&chunk).map(|_| f))
-                        .await
-                        .unwrap()
-                        .unwrap();
-                }
-                (*state.lock().unwrap()).set_last_file(file_path_last_name);
-            }
+    let data = req.form_data().await.unwrap();
+    for (name, value) in data.fields.iter() {
+        match name.as_str() {
             "name" => {
-                if let Some(chunk) = field.next().await {
-                    let data = chunk.expect("Get bytes from chunk of name error");
-                    (*state.lock().unwrap()).set_app_name(serde_json::from_slice(&data).unwrap());
-                }
+                info!("Value of name value: {:?}", value);
+                (*state.lock().unwrap()).set_app_name(value.to_string());
             }
             "version" => {
-                if let Some(chunk) = field.next().await {
-                    let data = chunk.expect("Get bytes from chunk of name error");
-                    (*state.lock().unwrap()).set_app_name(serde_json::from_slice(&data).unwrap());
-                }
+                info!("Value of version value: {:?}", value);
+                (*state.lock().unwrap()).set_version(value.to_string());
             }
-            _ => {}
+            &_ => {}
         }
     }
 
-    Ok(web::Json(GenericReply::err_internal(
-        "No apk upload".to_string(),
+    if let Some(file) = data.files.get("files") {
+        let mut dest = file_path.clone();
+        dest.push(&file_name);
+        info!("Copy file from {:?} to {:?}", file.path(), &dest);
+        if let Err(e) = fs::copy(file.path(), &dest) {
+            trace!("File Copy Failed: {}", e);
+            res.set_status_error(StatusError::internal_server_error());
+            return;
+        } else {
+            trace!("File Copy Success");
+            (*state.lock().unwrap()).set_last_file(file_name);
+        }
+    }
+    state.lock().unwrap().save();
+
+    res.render(Json(GenericReply::ok(
+        "Success apk upload".to_string(),
         "".to_string(),
     )))
 }

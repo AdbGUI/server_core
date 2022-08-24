@@ -1,10 +1,11 @@
-use crate::{config_path, errors::Error, model::reply::GenericReply};
-use actix_web::web::{self, Json};
+use crate::{config_path, model::reply::GenericReply};
+use salvo::{handler, Request, Response, writer::Json};
 use std::{fs, path::Path};
 
 use super::{get_state, ApkServiceConfig, CONFIG_FILE};
 
-pub async fn apk_get_data() -> actix_web::Result<Json<GenericReply<String>>, Error> {
+#[handler]
+pub async fn apk_get_data(_req: &mut Request, res: &mut Response) {
     let mut state = get_state().lock().unwrap();
     if state.is_empty() {
         let config_file = format!("{}/{}", config_path(), CONFIG_FILE);
@@ -14,20 +15,24 @@ pub async fn apk_get_data() -> actix_web::Result<Json<GenericReply<String>>, Err
             let cfg_raw = fs::read_to_string(cfg_path).unwrap();
             *state = serde_json::from_str::<ApkServiceConfig>(cfg_raw.as_str()).unwrap_or_default();
 
-            Ok(web::Json(GenericReply::<String>::ok(
+            res.render(Json(GenericReply::<String>::ok(
                 "".to_string(),
                 serde_json::to_string(&*state).unwrap(),
             )))
         } else {
-            Ok(web::Json(GenericReply::<String>::err_internal(
-                "No apk uploaded".to_string(),
-                "".to_string(),
-            )))
+            state.save();
+            info!("Not exist apk data file");
+            res.render(Json(GenericReply::<String>::ok(
+                "No apk data".to_string(),
+                serde_json::to_string(&*state).unwrap(),
+            )));
         }
     } else {
-        Ok(web::Json(GenericReply::<String>::ok(
+        state.save();
+        info!("Apk data is cached");
+        res.render(Json(GenericReply::<String>::ok(
             "".to_string(),
             serde_json::to_string(&*state).unwrap(),
-        )))
+        )));
     }
 }

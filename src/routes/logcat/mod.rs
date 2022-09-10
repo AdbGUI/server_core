@@ -1,3 +1,4 @@
+// Usings
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -6,7 +7,7 @@ use once_cell::sync::Lazy;
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use salvo::extra::ws::{Message, WsHandler};
+use salvo::extra::ws::{Message, WebSocket, WebSocketUpgrade};
 use salvo::prelude::*;
 
 type TxData = mpsc::UnboundedSender<Result<Message, salvo::Error>>;
@@ -29,63 +30,65 @@ static ONLINE_USERS: Lazy<Users> = Lazy::new(Users::default);
 
 #[handler]
 pub async fn user_connected(req: &mut Request, res: &mut Response) -> Result<(), StatusError> {
-    let origin = (*req.query_or_form::<String>(&"origin".to_owned()).await.unwrap_or("desktop".to_string())).to_string();
-    let fut = WsHandler::new().handle(req, res)?;
-    let fut = async move {
-        if let Some(ws) = fut.await {
-            let my_id = NEXT_USER_ID.fetch_add(1, Ordering::Relaxed);
+    let origin = req.query_or_form::<String>("origin").await.unwrap_or("desktop".to_string());
+    WebSocketUpgrade::new()
+        .handle(req, res, |ws| handle_socket(origin, ws))
+        .await
+}
 
-            info!("New User: {}", my_id);
+async fn handle_socket(origin: String, ws: WebSocket) {
+    // Use a counter to assign a new unique ID for this user.
+    let my_id = NEXT_USER_ID.fetch_add(1, Ordering::Relaxed);
 
-            // Split the socket into a sender and receive of messages.
-            let (user_ws_tx, mut user_ws_rx) = ws.split();
+    info!("new chat user: {}", my_id);
 
-            // Use an unbounded channel to handle buffering and flushing of messages
-            // to the websocket...
-            let (tx, rx) = mpsc::unbounded_channel();
-            let rx = UnboundedReceiverStream::new(rx);
-            let fut = rx.forward(user_ws_tx).map(|result| {
-                if let Err(e) = result {
-                    error!("websocket send error: {e}");
-                }
-            });
-            tokio::task::spawn(fut);
-            let fut = async move {
-                ONLINE_USERS.write().await.insert(
-                    my_id,
-                    UserWs {
-                        tx,
-                        origin: origin.to_string(),
-                    },
-                );
+    // Split the socket into a sender and receive of messages.
+    let (user_ws_tx, mut user_ws_rx) = ws.split();
 
-                while let Some(result) = user_ws_rx.next().await {
-                    let msg = match result {
-                        Ok(msg) => msg,
-                        Err(e) => {
-                            eprintln!("websocket error(uid={}): {}", my_id, e);
-                            break;
-                        }
-                    };
-                    user_message(my_id, msg).await;
-                }
-
-                user_disconnected(my_id).await;
-            };
-            tokio::task::spawn(fut);
+    // Use an unbounded channel to handle buffering and flushing of messages
+    // to the websocket...
+    let (tx, rx) = mpsc::unbounded_channel();
+    let rx = UnboundedReceiverStream::new(rx);
+    let fut = rx.forward(user_ws_tx).map(|result| {
+        if let Err(e) = result {
+            error!("websocket send error: {e}");
         }
+    });
+    tokio::task::spawn(fut);
+    let fut = async move {
+        ONLINE_USERS.write().await.insert(
+            my_id,
+            UserWs {
+                tx,
+                origin: origin.to_string(),
+            },
+        );
+
+        while let Some(result) = user_ws_rx.next().await {
+            let msg = match result {
+                Ok(msg) => msg,
+                Err(e) => {
+                    eprintln!("websocket error(uid={}): {}", my_id, e);
+                    break;
+                }
+            };
+            user_message(my_id, msg).await;
+        }
+
+        user_disconnected(my_id).await;
     };
     tokio::task::spawn(fut);
-    Ok(())
 }
+
 async fn user_message(my_id: usize, msg: Message) {
-    let msg = if let Some(s) = msg.to_str() {
+    let msg = if let Ok(s) = msg.to_str() {
         s
     } else {
         return;
     };
 
     let new_msg = format!("<User#{}>: {}", my_id, msg);
+    println!("Message: {}", &new_msg);
 
     let users = ONLINE_USERS.read().await;
     let users = users
